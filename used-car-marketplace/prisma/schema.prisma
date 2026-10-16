@@ -1,0 +1,270 @@
+// Prisma schema — Used Car Marketplace
+// Database: PostgreSQL
+// ออกแบบให้รองรับฟีเจอร์: ประกาศขายรถ, ค้นหา, แชต, แพ็กเกจ/จ่ายเงิน, แอดมิน, ไฟแนนซ์
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Enums ----------
+enum UserRole {
+  BUYER
+  SELLER
+  DEALER
+  ADMIN
+}
+
+enum ListingStatus {
+  DRAFT       // ร่าง
+  PENDING     // รออนุมัติ
+  PUBLISHED   // เผยแพร่
+  SOLD        // ขายแล้ว
+  PAUSED      // พักประกาศ
+  REJECTED    // ถูกปฏิเสธ
+}
+
+enum Transmission {
+  AUTO
+  MANUAL
+}
+
+enum FuelType {
+  GASOLINE
+  DIESEL
+  HYBRID
+  EV
+  LPG_NGV
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+  CANCELLED
+}
+
+enum FinancingStatus {
+  SUBMITTED
+  CONTACTED
+  APPROVED
+  REJECTED
+}
+
+enum ReportStatus {
+  OPEN
+  REVIEWING
+  RESOLVED
+  DISMISSED
+}
+
+// ---------- Users & Profiles ----------
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String?  // null ได้ถ้าเข้าด้วย OAuth
+  name         String?
+  phone        String?
+  role         UserRole @default(BUYER)
+  avatarUrl    String?
+  locale       String   @default("th") // th | en | zh
+  pushToken    String?  // Expo push token สำหรับส่ง notification ไปยังมือถือ
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  dealerProfile     DealerProfile?
+  listings          Listing[]
+  favorites         Favorite[]
+  sentMessages      Message[]            @relation("MessageSender")
+  buyerConversations Conversation[]      @relation("ConversationBuyer")
+  sellerConversations Conversation[]     @relation("ConversationSeller")
+  orders            Order[]
+  financingRequests FinancingRequest[]
+  reports           Report[]             @relation("Reporter")
+
+  @@index([role])
+}
+
+model DealerProfile {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shopName    String
+  description String?
+  address     String?
+  province    String?
+  logoUrl     String?
+  verified    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ---------- Listings ----------
+model Listing {
+  id           String        @id @default(cuid())
+  sellerId     String
+  seller       User          @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  make         String        // ยี่ห้อ
+  model        String        // รุ่น
+  year         Int
+  mileage      Int           // เลขไมล์ (กม.)
+  transmission Transmission
+  fuelType     FuelType
+  color        String?
+  priceCents   Int           // ราคา (เก็บเป็น cents/สตางค์ กันปัญหา floating point)
+  currency     String        @default("THB")
+  province     String
+  plateMasked  String?       // ทะเบียนแบบซ่อนบางส่วน
+  title        String
+  description  String        @db.Text
+  status       ListingStatus @default(PENDING)
+  isPromoted   Boolean       @default(false)
+  promotedUntil DateTime?
+  viewCount    Int           @default(0)
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  images        ListingImage[]
+  favorites     Favorite[]
+  conversations Conversation[]
+  financingRequests FinancingRequest[]
+  reports       Report[]
+
+  // index สำคัญสำหรับการค้นหา/กรองเมื่อข้อมูลโต
+  @@index([status, make, model])
+  @@index([priceCents])
+  @@index([year])
+  @@index([province])
+  @@index([createdAt])
+}
+
+model ListingImage {
+  id        String  @id @default(cuid())
+  listingId String
+  listing   Listing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  url       String
+  order     Int     @default(0)
+
+  @@index([listingId])
+}
+
+model Favorite {
+  userId    String
+  listingId String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@id([userId, listingId])
+}
+
+// ---------- Messaging ----------
+model Conversation {
+  id        String    @id @default(cuid())
+  listingId String
+  listing   Listing   @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  buyerId   String
+  buyer     User      @relation("ConversationBuyer", fields: [buyerId], references: [id])
+  sellerId  String
+  seller    User      @relation("ConversationSeller", fields: [sellerId], references: [id])
+  createdAt DateTime  @default(now())
+  messages  Message[]
+
+  @@unique([listingId, buyerId])
+  @@index([sellerId])
+}
+
+model Message {
+  id             String       @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  senderId       String
+  sender         User         @relation("MessageSender", fields: [senderId], references: [id])
+  body           String       @db.Text
+  readAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+// ---------- Packages / Payments ----------
+model Package {
+  id           String  @id @default(cuid())
+  name         String
+  description  String?
+  priceCents   Int
+  currency     String  @default("THB")
+  listingQuota Int     // จำนวนประกาศที่ได้
+  durationDays Int     // ระยะเวลา (วัน)
+  promotes     Boolean @default(false) // มีฟีเจอร์ดันประกาศขึ้นบนหรือไม่
+  active       Boolean @default(true)
+  orders       Order[]
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  userId      String
+  user        User        @relation(fields: [userId], references: [id])
+  packageId   String
+  package     Package     @relation(fields: [packageId], references: [id])
+  amountCents Int
+  currency    String      @default("THB")
+  status      OrderStatus @default(PENDING)
+  provider    String      // stripe | omise | 2c2p
+  providerRef String?     // payment intent / charge id
+  expiresAt   DateTime?   // วันหมดอายุของแพ็กเกจ
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  @@index([userId, status])
+}
+
+// ---------- Financing & Valuation ----------
+model FinancingRequest {
+  id             String          @id @default(cuid())
+  listingId      String
+  listing        Listing         @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User            @relation(fields: [userId], references: [id])
+  downPaymentCents Int
+  termMonths     Int
+  interestRate   Float           // ดอกเบี้ยต่อปี (%)
+  monthlyPaymentCents Int        // ค่างวด/เดือน (คำนวณไว้ตอนสร้าง)
+  status         FinancingStatus @default(SUBMITTED)
+  partnerRef     String?
+  createdAt      DateTime        @default(now())
+
+  @@index([status])
+}
+
+// ตารางกฎประเมินราคาเบื้องต้น (เริ่มแบบ rule-based; ต่อยอด ML ภายหลัง)
+model ValuationRule {
+  id            String  @id @default(cuid())
+  make          String
+  model         String
+  baseYear      Int
+  basePriceCents Int    // ราคาฐานของปีอ้างอิง
+  depreciationPerYear Float // % เสื่อมราคาต่อปี
+  pricePer1000Km Int    @default(0) // ปรับลดต่อระยะไมล์ 1,000 กม. (cents)
+
+  @@unique([make, model, baseYear])
+}
+
+// ---------- Moderation ----------
+model Report {
+  id         String       @id @default(cuid())
+  listingId  String
+  listing    Listing      @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  reporterId String
+  reporter   User         @relation("Reporter", fields: [reporterId], references: [id])
+  reason     String
+  status     ReportStatus @default(OPEN)
+  createdAt  DateTime     @default(now())
+
+  @@index([status])
+}
